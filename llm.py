@@ -10,9 +10,16 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
+from pinecone import Pinecone
+from pinecone.exceptions import UnauthorizedException, NotFoundException
+
 from config import answer_examples
 
 store = {}
+
+class LLMConfigError(Exception):
+    """잘못된 API Key / 인덱스 등 설정 오류를 짧은 메시지로 전달"""
+    pass
 
 
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
@@ -21,17 +28,37 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
     return store[session_id]
 
 
-def get_retriever():
-    embedding = OpenAIEmbeddings(model='text-embedding-3-large')
-    index_name = 'tax-markdown-index'
-    database = PineconeVectorStore.from_existing_index(index_name=index_name, embedding=embedding)
+def _safe_embeddings(openai_api_key: str) -> OpenAIEmbeddings:
+    try:
+        return OpenAIEmbeddings(model='text-embedding-3-large', api_key=openai_api_key)
+    except Exception as e:
+        raise LLMConfigError("OpenAI 키가 유효하지 않거나 Embeddings 초기화에 실패했습니다.") from e
+
+def _safe_pinecone_index(pinecone_api_key: str, index_name: str):
+    try:
+        pc = Pinecone(api_key=pinecone_api_key)
+        return pc.Index(index_name)
+    except UnauthorizedException as e:
+        raise LLMConfigError("Pinecone API Key가 유효하지 않습니다.") from e
+    except NotFoundException as e:
+        raise LLMConfigError(f"Pinecone 인덱스 '{index_name}' 를 찾을 수 없습니다.") from e
+    except Exception as e:
+        raise LLMConfigError("Pinecone 초기화 중 알 수 없는 오류가 발생했습니다.") from e
+
+
+def get_retriever(openai_api_key: str, pinecone_api_key: str, index_name: str = 'tax-markdown-index'):
+    embedding = _safe_embeddings(openai_api_key)
+    index = _safe_pinecone_index(pinecone_api_key, index_name)
+
+    database = PineconeVectorStore(index=index, embedding=embedding, text_key="text")
     retriever = database.as_retriever(search_kwargs={'k': 4})
     return retriever
 
-def get_history_retriever():
-    llm = get_llm()
-    retriever = get_retriever()
-    
+
+def get_history_retriever(openai_api_key: str, pinecone_api_key: str, index_name: str = 'tax-markdown-index'):
+    llm = get_llm(openai_api_key=openai_api_key)
+    retriever = get_retriever(openai_api_key=openai_api_key, pinecone_api_key=pinecone_api_key, index_name=index_name)
+
     contextualize_q_system_prompt = (
         "Given a chat history and the latest user question "
         "which might reference context in the chat history, "
@@ -47,47 +74,46 @@ def get_history_retriever():
             ("human", "{input}"),
         ]
     )
-    
+
     history_aware_retriever = create_history_aware_retriever(
         llm, retriever, contextualize_q_prompt
     )
     return history_aware_retriever
 
 
-def get_llm(model='gpt-4o'):
-    llm = ChatOpenAI(model=model)
+def get_llm(model='gpt-4o', openai_api_key: str = None):
+    llm = ChatOpenAI(model=model, api_key=openai_api_key)
     return llm
 
 
-def get_dictionary_chain():
+def get_dictionary_chain(openai_api_key: str):
     dictionary = ["사람을 나타내는 표현 -> 거주자"]
-    llm = get_llm()
-    prompt = ChatPromptTemplate.from_template(f"""
+    llm = get_llm(openai_api_key=openai_api_key)
+    prompt = ChatPromptTemplate.from_template("""
         사용자의 질문을 보고, 우리의 사전을 참고해서 사용자의 질문을 변경해주세요.
         만약 변경할 필요가 없다고 판단된다면, 사용자의 질문을 변경하지 않아도 됩니다.
         그런 경우에는 질문만 리턴해주세요
         사전: {dictionary}
-        
-        질문: {{question}}
-    """)
+
+        질문: {input}
+    """).partial(dictionary=str(dictionary))
 
     dictionary_chain = prompt | llm | StrOutputParser()
-    
     return dictionary_chain
 
 
-def get_rag_chain():
-    llm = get_llm()
+def get_rag_chain(openai_api_key: str, pinecone_api_key: str, index_name: str = 'tax-markdown-index'):
+    llm = get_llm(openai_api_key=openai_api_key)
+
     example_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("human", "{input}"),
-            ("ai", "{answer}"),
-        ]
+        [("human", "{input}"), ("ai", "{answer}")]
     )
+
     few_shot_prompt = FewShotChatMessagePromptTemplate(
         example_prompt=example_prompt,
         examples=answer_examples,
     )
+
     system_prompt = (
         "당신은 소득세법 전문가입니다. 사용자의 소득세법에 관한 질문에 답변해주세요"
         "아래에 제공된 문서를 활용해서 답변해주시고"
@@ -97,20 +123,17 @@ def get_rag_chain():
         "\n\n"
         "{context}"
     )
-    
-    qa_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system_prompt),
-            few_shot_prompt,
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-    history_aware_retriever = get_history_retriever()
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
 
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [("system", system_prompt), few_shot_prompt, MessagesPlaceholder("chat_history"), ("human", "{input}")]
+    )
+
+    history_aware_retriever = get_history_retriever(
+        openai_api_key=openai_api_key, pinecone_api_key=pinecone_api_key, index_name=index_name
+    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-    
+
     conversational_rag_chain = RunnableWithMessageHistory(
         rag_chain,
         get_session_history,
@@ -118,21 +141,18 @@ def get_rag_chain():
         history_messages_key="chat_history",
         output_messages_key="answer",
     ).pick('answer')
-    
+
     return conversational_rag_chain
 
 
-def get_ai_response(user_message):
-    dictionary_chain = get_dictionary_chain()
-    rag_chain = get_rag_chain()
-    tax_chain = {"input": dictionary_chain} | rag_chain
-    ai_response = tax_chain.stream(
-        {
-            "question": user_message
-        },
-        config={
-            "configurable": {"session_id": "abc123"}
-        },
-    )
+def get_ai_response(user_message, openai_api_key, pinecone_api_key, index_name: str = 'tax-markdown-index'):
+    dictionary_chain = get_dictionary_chain(openai_api_key=openai_api_key)
+    rag_chain = get_rag_chain(openai_api_key=openai_api_key, pinecone_api_key=pinecone_api_key, index_name=index_name)
 
+    tax_chain = {"input": dictionary_chain} | rag_chain
+
+    ai_response = tax_chain.stream(
+        {"input": user_message},
+        config={"configurable": {"session_id": "abc123"}},
+    )
     return ai_response
